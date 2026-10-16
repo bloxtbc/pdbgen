@@ -66,7 +66,10 @@ llvm::codeview::TypeIndex lookup(std::string key) {
     return entry->second;
 }
 
-template <typename T> llvm::codeview::TypeIndex insert(std::string key, T &record) {
+template <typename T> llvm::codeview::TypeIndex insert(std::string key, T &record, bool require_unique = false) {
+    if (require_unique && type_cache.find(key) != type_cache.end()) {
+        throw std::runtime_error("duplicate function type id: " + key);
+    }
     llvm::codeview::TypeIndex idx = ttb_tpi.writeLeafType(record);
     type_cache[key] = idx;
     return idx;
@@ -688,7 +691,7 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
             insert(id, entry.get<llvm::codeview::ClassRecord>());
             break;
         case LF_PROCEDURE:
-            insert(id, entry.get<llvm::codeview::ProcedureRecord>());
+            insert(id, entry.get<llvm::codeview::ProcedureRecord>(), true);
             break;
         case LF_UNION:
             insert(id, entry.get<llvm::codeview::UnionRecord>());
@@ -952,7 +955,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    if (!json.empty() and !std::filesystem::exists(json)) {
+    if (!json.empty() && !std::filesystem::exists(json)) {
         std::cerr << json << " does not exist" << std::endl;
         return 2;
     }

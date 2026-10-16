@@ -118,6 +118,18 @@ public class PdbGen extends GhidraScript {
 	}
 
 	private String GetId(DataType dt) {
+		if (dt instanceof FunctionDefinition) {
+			FunctionDefinition function = (FunctionDefinition) dt;
+			// Function names are not unique; key procedure records by their complete signature.
+			StringBuilder id = new StringBuilder(GetIdUnmapped(dt));
+			id.append("@fn(").append(function.getCallingConventionName()).append("):");
+			id.append(GetId(function.getReturnType())).append("(");
+			for (ParameterDefinition argument : function.getArguments()) {
+				id.append(GetId(argument.getDataType())).append(";");
+			}
+			return id.append(")").toString();
+		}
+
 		String key = GetIdUnmapped(dt);
 
 		// follow the typedefs to the original type.
@@ -312,6 +324,9 @@ public class PdbGen extends GhidraScript {
 
 	private List<JsonObject> toJson(DataType dt) {
 		if (dt instanceof FunctionDefinition) {
+			if (isSerialized(dt)) {
+				return new ArrayList<JsonObject>();
+			}
 			return dump((FunctionDefinition) dt);
 		}
 
