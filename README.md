@@ -43,7 +43,33 @@ This project is still very much a WIP, but the basic components should be usable
 1. We do not need the original binary for Ghidra (it has all the information already)
    1. however I would like to support IDA, which AFAIK discards the pe headers after importing.
 
-## How to Build
+   ## Ghidra export filtering
+
+   `PdbGen.java` applies conservative name- and metadata-based function filtering before
+   retrieving function signatures. Unwind helpers, recognized MSVC/runtime helpers,
+   external functions, and thunks with external or recognized runtime destinations are
+   excluded by default. Other internal thunks—including member-function/vtable thunks—
+   and unnamed or unfamiliar functions remain eligible. The exporter still includes the
+   program's data types and non-function symbols, and the JSON schema is unchanged.
+
+   Optional Script Manager arguments can override the defaults:
+
+   | Argument | Effect |
+   | --- | --- |
+   | `--exclude-runtime` / `--include-runtime` | Enable/disable MSVC, STL, and named CRT filtering (enabled by default). |
+   | `--exclude-unwind` / `--include-unwind` | Enable/disable generated unwind-name filtering (enabled by default). |
+   | `--exclude-thunks` / `--include-thunks` | Exclude only import/runtime-target thunks or retain them (first option is the default). |
+   | `--exclude-compiler` / `--include-compiler` | Enable/disable filtering of recognized compiler support helpers (enabled by default). |
+   | `--exclude-non-executable` / `--include-non-executable` | Filter functions outside executable memory blocks; disabled by default due to possible hand-marked code. |
+   | `--verbose-filtering` | Print up to ten examples for each filtered category. |
+   | `--pdbgen-exe <path>` | Run a specific `pdbgen.exe`; otherwise use `PDBGEN_EXE` or resolve `pdbgen.exe` from `PATH`. |
+
+   The exporter prints discovered/exported function counts, exclusions by category,
+   type/symbol record counts, reduction, JSON size, and elapsed time at the end of a
+   successful export. Filtering does not classify functions by size, instruction count,
+   missing names, or thunk status alone.
+
+   ## How to Build
 
 ```sh
 # You will require a c++17 compliant compiler

@@ -12,12 +12,17 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -46,6 +51,7 @@ import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.FunctionSignature;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolType;
@@ -63,10 +69,308 @@ public class PdbGen extends GhidraScript {
 	// Note: we are manually serializing json here, this is just to avoid any dependencies.
 	// this means it will break if we have any fields that need escaping.
 	Map<String, String> typedefs = new HashMap<String, String>();
-	List<String> serialized = new ArrayList<String>();
+	Set<String> serialized = new HashSet<String>();
 	Map<String, String> forwardDeclared = new HashMap<String, String>();
 
 	Map<Address, FunctionDefinition> entrypoints = new HashMap<Address, FunctionDefinition>();
+	Map<Address, Function> exportableFunctions = new HashMap<Address, Function>();
+	private FilterConfiguration filterConfiguration = new FilterConfiguration();
+	private final FilterStatistics filterStatistics = new FilterStatistics();
+	private String pdbgenExecutable = "pdbgen.exe";
+
+	private static final String[] UNWIND_PREFIXES = {
+		"unwind@", "__unwind", "__ehunwind", "__ehhandler$"
+	};
+
+	// Match reserved runtime spellings and standard-library namespaces, not generic
+	// compiler-looking names or short functions; custom allocators remain eligible.
+	private static final String[] RUNTIME_PREFIXES = {
+		"__cxxframehandler", "___cxxframehandler", "_cxxthrowexception",
+		"__cxxthrowexception", "_eh", "__eh", "_rtc", "__rtc",
+		"_security_", "__security_", "___security_", "__gs",
+		"___gs", "__guard_", "__report_gsfailure", "_except_handler",
+		"__except_handler", "_c_specific_handler", "__c_specific_handler",
+		"___c_specific_handler", "__cxxregisterexceptionobject",
+		"__cxxdetectrethrow", "__cxxunregisterexceptionobject",
+		"_delayloadhelper", "__delayloadhelper",
+		"__funloaddelayloadeddll", "??_r", "??_7type_info",
+		"??_gtype_info"
+	};
+
+	private static final String[] CRT_FUNCTION_NAMES = {
+		"memcpy", "memmove", "memset", "memcmp", "strlen", "strcpy",
+		"strncpy", "strcat", "strcmp", "strncmp", "malloc", "calloc",
+		"realloc", "free", "printf", "sprintf", "vsprintf"
+	};
+
+	private static final String[] COMPILER_FUNCTION_PREFIXES = {
+		"__chkstk", "___chkstk", "_chkstk", "__alloca_probe",
+		"_alloca_probe", "__allmul", "__alldiv", "__aulldiv",
+		"__allrem", "__aullrem", "__allshl", "__allshr", "__aullshr",
+		"__ftol"
+	};
+
+	private static class FilterConfiguration {
+		boolean excludeRuntime = true;
+		boolean excludeUnwind = true;
+		boolean excludeThunks = true;
+		boolean excludeCompiler = true;
+		boolean excludeNonExecutable = false;
+		boolean verbose = false;
+	}
+
+	private static class FilterStatistics {
+		int discovered;
+		int exported;
+		int unwindSkipped;
+		int runtimeSkipped;
+		int importThunksSkipped;
+		int compilerSkipped;
+		int nonExecutableSkipped;
+		int externalSkipped;
+		int typeRecords;
+		int symbolRecords;
+		long startNanos;
+		final Map<String, List<String>> examples = new HashMap<String, List<String>>();
+
+		void record(String category, String name) {
+			List<String> names = examples.get(category);
+			if (names == null) {
+				names = new ArrayList<String>();
+				examples.put(category, names);
+			}
+			if (names.size() < 10) {
+				names.add(name);
+			}
+		}
+	}
+
+	private void configureFiltering() {
+		filterConfiguration = new FilterConfiguration();
+		String configuredExecutable = System.getenv("PDBGEN_EXE");
+		pdbgenExecutable = configuredExecutable == null || configuredExecutable.isEmpty() ?
+			"pdbgen.exe" : configuredExecutable;
+		String[] arguments = getScriptArgs();
+		for (int i = 0; i < arguments.length; i++) {
+			String argument = arguments[i];
+			if ("--exclude-runtime".equals(argument)) {
+				filterConfiguration.excludeRuntime = true;
+			} else if ("--include-runtime".equals(argument)) {
+				filterConfiguration.excludeRuntime = false;
+			} else if ("--exclude-unwind".equals(argument)) {
+				filterConfiguration.excludeUnwind = true;
+			} else if ("--include-unwind".equals(argument)) {
+				filterConfiguration.excludeUnwind = false;
+			} else if ("--exclude-thunks".equals(argument)) {
+				filterConfiguration.excludeThunks = true;
+			} else if ("--include-thunks".equals(argument)) {
+				filterConfiguration.excludeThunks = false;
+			} else if ("--exclude-compiler".equals(argument)) {
+				filterConfiguration.excludeCompiler = true;
+			} else if ("--include-compiler".equals(argument)) {
+				filterConfiguration.excludeCompiler = false;
+			} else if ("--exclude-non-executable".equals(argument)) {
+				filterConfiguration.excludeNonExecutable = true;
+			} else if ("--include-non-executable".equals(argument)) {
+				filterConfiguration.excludeNonExecutable = false;
+			} else if ("--verbose-filtering".equals(argument)) {
+				filterConfiguration.verbose = true;
+			} else if ("--pdbgen-exe".equals(argument)) {
+				if (++i >= arguments.length || arguments[i].isEmpty()) {
+					throw new IllegalArgumentException("--pdbgen-exe requires a path");
+				}
+				pdbgenExecutable = arguments[i];
+			} else if (argument.startsWith("--pdbgen-exe=")) {
+				pdbgenExecutable = argument.substring("--pdbgen-exe=".length());
+				if (pdbgenExecutable.isEmpty()) {
+					throw new IllegalArgumentException("--pdbgen-exe requires a path");
+				}
+			} else {
+				throw new IllegalArgumentException("Unknown PdbGen option: " + argument);
+			}
+		}
+	}
+
+	private String normalizedFunctionName(String name) {
+		String normalized = name;
+		while (normalized.startsWith("FID_conflict:")) {
+			normalized = normalized.substring("FID_conflict:".length());
+		}
+		if (normalized.startsWith("thunk_")) {
+			normalized = normalized.substring("thunk_".length());
+		}
+		return normalized;
+	}
+
+	private boolean startsWithAny(String value, String[] prefixes) {
+		for (String prefix : prefixes) {
+			if (value.startsWith(prefix)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean isUnwindFunction(String name) {
+		String normalized = normalizedFunctionName(name).toLowerCase(Locale.ROOT);
+		return startsWithAny(normalized, UNWIND_PREFIXES);
+	}
+
+	private boolean isVisualStudioRuntimeFunction(String name) {
+		String normalized = normalizedFunctionName(name).toLowerCase(Locale.ROOT);
+		if (normalized.startsWith("scimitar::")) {
+			return false;
+		}
+		if (normalized.startsWith("std::") || normalized.startsWith("stdext::") ||
+			normalized.startsWith("type_info::")) {
+			return true;
+		}
+		if (startsWithAny(normalized, RUNTIME_PREFIXES)) {
+			return true;
+		}
+		if (normalized.indexOf("::") < 0) {
+			for (String functionName : CRT_FUNCTION_NAMES) {
+				if (normalized.equals(functionName) || normalized.equals("_" + functionName)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private boolean isCompilerGeneratedFunction(String name) {
+		String normalized = normalizedFunctionName(name).toLowerCase(Locale.ROOT);
+		return startsWithAny(normalized, COMPILER_FUNCTION_PREFIXES);
+	}
+
+	private boolean isImportThunk(Function function) {
+		// An external destination is definitive import evidence; other thunks need
+		// a separately recognized runtime destination before they can be removed.
+		if (!function.isThunk()) {
+			return false;
+		}
+		Function target = function.getThunkedFunction(false);
+		return target != null && target.isExternal();
+	}
+
+	private boolean isTrivialThunk(Function function) {
+		if (!function.isThunk()) {
+			return false;
+		}
+		Function target = function.getThunkedFunction(false);
+		return target != null &&
+			(isVisualStudioRuntimeFunction(target.getName(true)) ||
+			 isCompilerGeneratedFunction(target.getName(true)));
+	}
+
+	private String getFunctionFilterReason(Function function) {
+		if (function.isExternal()) {
+			return "external";
+		}
+		String name = function.getName(true);
+		if (filterConfiguration.excludeUnwind && isUnwindFunction(name)) {
+			return "unwind";
+		}
+		if (filterConfiguration.excludeRuntime && isVisualStudioRuntimeFunction(name)) {
+			return "runtime";
+		}
+		if (filterConfiguration.excludeThunks &&
+			(isImportThunk(function) || isTrivialThunk(function))) {
+			return "import thunk";
+		}
+		if (filterConfiguration.excludeCompiler && isCompilerGeneratedFunction(name)) {
+			return "compiler";
+		}
+		if (filterConfiguration.excludeNonExecutable) {
+			MemoryBlock block = currentProgram.getMemory().getBlock(function.getEntryPoint());
+			if (block != null && !block.isExecute()) {
+				return "non-executable";
+			}
+		}
+		return null;
+	}
+
+	private boolean shouldExportFunction(Function function) {
+		String reason = getFunctionFilterReason(function);
+		if (reason == null) {
+			return true;
+		}
+		switch (reason) {
+			case "unwind":
+				filterStatistics.unwindSkipped++;
+				break;
+			case "runtime":
+				filterStatistics.runtimeSkipped++;
+				break;
+			case "import thunk":
+				filterStatistics.importThunksSkipped++;
+				break;
+			case "compiler":
+				filterStatistics.compilerSkipped++;
+				break;
+			case "non-executable":
+				filterStatistics.nonExecutableSkipped++;
+				break;
+			case "external":
+				filterStatistics.externalSkipped++;
+				break;
+			default:
+				throw new IllegalStateException("Unknown function filter category: " + reason);
+		}
+		if (filterConfiguration.verbose) {
+			filterStatistics.record(reason, function.getName(true));
+		}
+		return false;
+	}
+
+	private void discoverFunctions() {
+		FunctionManager manager = currentProgram.getFunctionManager();
+		Iterator<Function> functions = manager.getFunctionsNoStubs(true);
+		while (functions.hasNext()) {
+			Function function = functions.next();
+			filterStatistics.discovered++;
+			if (!shouldExportFunction(function)) {
+				continue;
+			}
+			Address entry = function.getEntryPoint();
+			exportableFunctions.put(entry, function);
+			filterStatistics.exported++;
+			if (!function.isThunk()) {
+				FunctionSignature signature = function.getSignature();
+				if (signature instanceof FunctionDefinition) {
+					entrypoints.put(entry, (FunctionDefinition) signature);
+				}
+			}
+		}
+	}
+
+	private void printFilterStatistics(String jsonPath) {
+		int filtered = filterStatistics.discovered - filterStatistics.exported;
+		double reduction = filterStatistics.discovered == 0 ? 0.0 :
+			100.0 * filtered / filterStatistics.discovered;
+		printf("[PDBGEN] Functions discovered:       %d\n", filterStatistics.discovered);
+		printf("[PDBGEN] Functions exported:         %d\n", filterStatistics.exported);
+		printf("[PDBGEN] Unwind functions skipped:   %d\n", filterStatistics.unwindSkipped);
+		printf("[PDBGEN] MSVC/runtime skipped:       %d\n", filterStatistics.runtimeSkipped);
+		printf("[PDBGEN] Import thunks skipped:      %d\n", filterStatistics.importThunksSkipped);
+		printf("[PDBGEN] Other compiler functions:   %d\n", filterStatistics.compilerSkipped);
+		printf("[PDBGEN] Non-executable skipped:     %d\n", filterStatistics.nonExecutableSkipped);
+		printf("[PDBGEN] External functions skipped: %d\n", filterStatistics.externalSkipped);
+		printf("[PDBGEN] Function reduction:         %.2f%%\n", reduction);
+		printf("[PDBGEN] Type records exported:      %d\n", filterStatistics.typeRecords);
+		printf("[PDBGEN] Symbol records exported:    %d\n", filterStatistics.symbolRecords);
+		printf("[PDBGEN] JSON size:                  %d bytes\n",
+			new File(jsonPath).length());
+		printf("[PDBGEN] Export elapsed:             %.2f seconds\n",
+			(System.nanoTime() - filterStatistics.startNanos) / 1000000000.0);
+		if (filterConfiguration.verbose) {
+			for (Map.Entry<String, List<String>> entry : filterStatistics.examples.entrySet()) {
+				for (String name : entry.getValue()) {
+					printf("[filter] %-40s -> %s\n", name, entry.getKey());
+				}
+			}
+		}
+	}
 
 	private boolean isSerialized(DataType dt) {
 		String id = GetId(dt);
@@ -487,7 +791,9 @@ public class PdbGen extends GhidraScript {
 					continue; // waiting for dependencies to added first
 				}
 
-				printf("[PDBGEN] dumped: id=%s, original=%s\n", GetId(dt), GetIdUnmapped(dt));
+				if (filterConfiguration.verbose) {
+					printf("[PDBGEN] dumped: id=%s, original=%s\n", GetId(dt), GetIdUnmapped(dt));
+				}
 				itr.remove();
 				for (JsonObject entry : entries) {
 					json.add(entry);
@@ -569,19 +875,12 @@ public class PdbGen extends GhidraScript {
 			}
 		}
 
-		// functions are not apart of the data type manager apparently.
-		Iterator<Function> functions = currentProgram.getFunctionManager().getFunctionsNoStubs(true);
-		while (functions.hasNext()) {
-			Function function = functions.next();
-			if (function.isThunk()) continue;
-			if (function.isExternal()) continue;
-			FunctionSignature signature = function.getSignature();
-			if (signature instanceof FunctionDefinition) {
-				datatypes.add((FunctionDefinition) signature);
-				entrypoints.put(function.getEntryPoint(), (FunctionDefinition) signature);
-				for (ParameterDefinition argument : signature.getArguments()) {
-					datatypes.add(argument.getDataType());
-				}
+		// Function signatures are not part of the data type manager.
+		for (Map.Entry<Address, FunctionDefinition> entry : entrypoints.entrySet()) {
+			FunctionDefinition signature = entry.getValue();
+			datatypes.add(signature);
+			for (ParameterDefinition argument : signature.getArguments()) {
+				datatypes.add(argument.getDataType());
 			}
 		}
 
@@ -612,7 +911,11 @@ public class PdbGen extends GhidraScript {
 			}
 		}
 
-		return datatypes;
+		Map<String, DataType> uniqueTypes = new LinkedHashMap<String, DataType>();
+		for (DataType dt : datatypes) {
+			uniqueTypes.putIfAbsent(GetId(dt), dt);
+		}
+		return new ArrayList<DataType>(uniqueTypes.values());
 	}
 
 
@@ -633,7 +936,6 @@ public class PdbGen extends GhidraScript {
 		monitor.setCancelEnabled(true);
 
 		JsonArray objs = new JsonArray();
-		FunctionManager manager = currentProgram.getFunctionManager();
 		for (Symbol symbol : symbols) {
 			monitor.checkCanceled();
 			monitor.incrementProgress(1);
@@ -651,7 +953,10 @@ public class PdbGen extends GhidraScript {
 			String name = symbol.getName(true);
 			if (stype == SymbolType.CLASS) {
 			} else if (stype == SymbolType.FUNCTION) {
-				Function function = manager.getFunctionAt(address);
+				Function function = exportableFunctions.get(address);
+				if (function == null) {
+					continue;
+				}
 				// we rename any thunks to easily distinguish them from the actual functions
 				if (function.isThunk() && !name.startsWith("thunk_")) {
 					name = "thunk_"+name;
@@ -669,6 +974,9 @@ public class PdbGen extends GhidraScript {
 				// for what ever reason, the ID of the FunctionSignature is different from when we dumps the types,
 				// so we cache the original type, and use the function's address to find it now.
 				FunctionDefinition definition = entrypoints.get(address);
+				if (definition == null) {
+					continue;
+				}
 
 				String id = GetId(definition);
 //				printf("signature [%s] %s %s", definition.getName(), id, definition.getClass().getName());
@@ -790,7 +1098,9 @@ public class PdbGen extends GhidraScript {
 
 		for (String key : aliases.keySet()) {
 			String value = aliases.get(key);
-			printf("alias: %s -> %s\n", key, value);
+			if (filterConfiguration.verbose) {
+				printf("alias: %s -> %s\n", key, value);
+			}
 			DataType dt = currentProgram.getDataTypeManager().getDataType(key);
 			String typeid = GetIdUnmapped(dt);
 
@@ -879,7 +1189,8 @@ public class PdbGen extends GhidraScript {
 		return symbolOutputPath;
 	}
 	
-	public void run() throws Exception {
+	private void runExport() throws Exception {
+		configureFiltering();
 		if (state.getTool() != null) {
 			ConsoleService console = state.getTool().getService(ConsoleService.class);
 			console.clearMessages();
@@ -909,15 +1220,34 @@ public class PdbGen extends GhidraScript {
 		typedefs.clear();
 		serialized.clear();
 		forwardDeclared.clear();
+		entrypoints.clear();
+		exportableFunctions.clear();
+		filterStatistics.discovered = 0;
+		filterStatistics.exported = 0;
+		filterStatistics.unwindSkipped = 0;
+		filterStatistics.runtimeSkipped = 0;
+		filterStatistics.importThunksSkipped = 0;
+		filterStatistics.compilerSkipped = 0;
+		filterStatistics.nonExecutableSkipped = 0;
+		filterStatistics.externalSkipped = 0;
+		filterStatistics.typeRecords = 0;
+		filterStatistics.symbolRecords = 0;
+		filterStatistics.examples.clear();
+		filterStatistics.startNanos = System.nanoTime();
 
 		// setup typedefs so we can map to basic types
 		initializeTypeDefs();
+		discoverFunctions();
 
 		JsonObject json = new JsonObject();
 
 		// Now serialize all the data types (in dependency order)
-		json.add("types", toJson(getAllDataTypes()));
-		json.add("symbols", toJsonSymbols(getAllSymbols()));
+		JsonArray typeRecords = toJson(getAllDataTypes());
+		JsonArray symbolRecords = toJsonSymbols(getAllSymbols());
+		filterStatistics.typeRecords = typeRecords.size();
+		filterStatistics.symbolRecords = symbolRecords.size();
+		json.add("types", typeRecords);
+		json.add("symbols", symbolRecords);
 
 
 		// Ghidra has unhelpfully set the path to \C:\\Something\ this gives as a normal c:\\Something
@@ -935,19 +1265,28 @@ public class PdbGen extends GhidraScript {
 			pdbfile.getParentFile().mkdirs();
 		}
 
-		FileWriter w = new FileWriter(jsonpath);
-		w.write(json.toString());
-		w.close();
+		String jsonText = json.toString();
+		try (FileWriter w = new FileWriter(jsonpath)) {
+			w.write(jsonText);
+		}
 
 		monitor.setIndeterminate(true);
 		monitor.setCancelEnabled(true);
 
 		ProcessBuilder pdbgen = new ProcessBuilder();
-		pdbgen.command("pdbgen.exe", exepath, "-", "--output", output);
+		printf("[PDBGEN] Launching generator: %s\n", pdbgenExecutable);
+		pdbgen.command(pdbgenExecutable, exepath, "-", "--output", output);
 
-		Process proc = pdbgen.start();
+		Process proc;
+		try {
+			proc = pdbgen.start();
+		} catch (IOException e) {
+			throw new IOException("Unable to start PdbGen executable '" +
+				pdbgenExecutable + "'. Set PDBGEN_EXE or pass --pdbgen-exe <path>.",
+				e);
+		}
 		PrintWriter stdin = new PrintWriter(proc.getOutputStream());
-		stdin.write(json.toString());
+		stdin.write(jsonText);
 		stdin.close();
 
 		while (proc.isAlive()) {
@@ -967,6 +1306,21 @@ public class PdbGen extends GhidraScript {
 			proc.waitFor(100, TimeUnit.MILLISECONDS);
 		}
 
+		printFilterStatistics(jsonpath);
 		return;
+	}
+
+	public void run() throws Exception {
+		try {
+			runExport();
+		} catch (Exception e) {
+			printerr("[PDBGEN] ERROR: " + e.getClass().getName());
+			printerr("[PDBGEN] MESSAGE: " +
+				(e.getMessage() == null ? "(no message)" : e.getMessage()));
+			StringWriter trace = new StringWriter();
+			e.printStackTrace(new PrintWriter(trace));
+			printerr(trace.toString());
+			throw e;
+		}
 	}
 }
